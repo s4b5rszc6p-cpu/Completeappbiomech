@@ -1,61 +1,22 @@
 """
-Platforma Diagnostyki Biomechanicznej
-Moduły: Kinematyka AI (Wideo), Kinovea, Biomechanika Biegu, Historia Garmin.
+Platforma Diagnostyki Biomechanicznej - Wersja Hybrydowa (Edge AI)
 """
 
 import io
-import tempfile
-import cv2
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
-# Bezpieczny import MediaPipe (Streamlit Cloud obsługuje go bez problemu)
-try:
-    import mediapipe as mp
-    MP_AVAILABLE = True
-except ImportError:
-    MP_AVAILABLE = False
-
-# --------------------------------------------------------------------------- #
-# Konfiguracja i Zmienne Globalne
-# --------------------------------------------------------------------------- #
 st.set_page_config(page_title="Biomechanika AI", page_icon="🏃", layout="wide")
 
-PORTFOLIO_URL = "przykładowy-link"
-
-RUNNING_COLUMNS = ["Dystans", "Tetno", "GCT"]
 GARMIN_NUMERIC_COLS = [
     "Dystans", "Średnie tętno", "Średni czas kontaktu z podłożem", 
     "Średnie odchylenie pionowe", "Średnia kadencja biegu", "Suma kalorii"
 ]
-
-if MP_AVAILABLE:
-    mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
-    JOINT_MAP = {
-        "right_arm": (mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_ELBOW, mp_pose.PoseLandmark.RIGHT_WRIST),
-        "left_arm": (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW, mp_pose.PoseLandmark.LEFT_WRIST),
-        "right_leg": (mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_KNEE, mp_pose.PoseLandmark.RIGHT_ANKLE),
-        "left_leg": (mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.LEFT_KNEE, mp_pose.PoseLandmark.LEFT_ANKLE),
-    }
-
-# --------------------------------------------------------------------------- #
-# Funkcje Pomocnicze (Matematyka i CSV)
-# --------------------------------------------------------------------------- #
-def calculate_angle_2d(a, b, c):
-    ba = np.array([a[0] - b[0], a[1] - b[1]])
-    bc = np.array([c[0] - b[0], c[1] - b[1]])
-    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
-    return np.degrees(np.arccos(cosine_angle))
-
-def window_mean(series, window):
-    if window <= 1: return series
-    return series.rolling(window=window, center=True, min_periods=1).mean()
 
 def _decode_bytes(raw: bytes) -> str:
     for encoding in ("utf-8-sig", "cp1250", "latin-1"):
@@ -69,233 +30,185 @@ def _to_numeric(series):
     return pd.to_numeric(series, errors="coerce")
 
 # --------------------------------------------------------------------------- #
-# Moduł 1: AI VIDEO (MediaPipe + VBT)
+# Moduł 1: AI VIDEO (Działa w przeglądarce - Zero obciążenia serwera)
 # --------------------------------------------------------------------------- #
 def render_ai_video_module():
-    st.title("🤖 Analiza Wideo AI (MediaPipe) & VBT")
-    st.markdown("Wgraj nagranie MP4 z telefonu. Serwer przetworzy ruch, wyliczy kąty, prędkości i pokaże krytyczną klatkę ruchu.")
+    st.title("🤖 Analiza Wideo AI (Edge Computing)")
+    st.markdown("Moduł przetwarza nagranie bezpośrednio w procesorze Twojego urządzenia, całkowicie omijając limity serwerów Streamlit.")
     
-    if not MP_AVAILABLE:
-        st.error("Błąd: Biblioteka MediaPipe nie jest zainstalowana. Sprawdź requirements.txt")
-        return
+    html_code = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    </head>
+    <body class="bg-white p-4 font-sans text-gray-800">
+        <div class="bg-gray-50 p-5 rounded-xl border mb-6">
+            <div class="grid grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label class="block font-medium mb-1 text-sm">Badany staw:</label>
+                    <select id="ai-chain" class="w-full p-2 border rounded-lg text-sm">
+                        <option value="right_arm">Prawa ręka (Bark-Łokieć-Nadgarstek)</option>
+                        <option value="left_arm">Lewa ręka (Bark-Łokieć-Nadgarstek)</option>
+                        <option value="right_leg">Prawa noga (Biodro-Kolano-Kostka)</option>
+                        <option value="left_leg">Lewa noga (Biodro-Kolano-Kostka)</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block font-medium mb-1 text-sm">Kąt celu [°]:</label>
+                    <input type="number" id="ai-target" value="90" class="w-full p-2 border rounded-lg text-sm">
+                </div>
+            </div>
+            <input type="file" id="video-file" accept="video/mp4,video/quicktime" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:bg-blue-50 file:text-blue-700">
+            <button onclick="startAnalysis()" id="btn-start" class="bg-blue-600 text-white px-5 py-2 rounded-lg text-sm font-medium">Rozpocznij Analizę</button>
+            <div id="status" class="mt-3 text-sm text-blue-600 hidden">Ładowanie sztucznej inteligencji...</div>
+        </div>
 
-    col1, col2 = st.columns(2)
-    with col1:
-        chain_name = st.selectbox("Badany staw (wierzchołek kąta):", [
-            ("right_arm", "Prawa ręka (Bark - Łokieć - Nadgarstek)"),
-            ("left_arm", "Lewa ręka (Bark - Łokieć - Nadgarstek)"),
-            ("right_leg", "Prawa noga (Biodro - Kolano - Kostka)"),
-            ("left_leg", "Lewa noga (Biodro - Kolano - Kostka)"),
-        ], format_func=lambda x: x[1])[0]
-    with col2:
-        target_angle = st.number_input("Kąt docelowy / referencyjny [°]:", min_value=10, max_value=180, value=90)
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            <video id="video" playsinline muted class="hidden"></video>
+            <canvas id="canvas" class="w-full h-auto bg-black rounded-lg hidden"></canvas>
+            <div id="metrics" class="hidden grid grid-cols-2 gap-2 content-start"></div>
+        </div>
+        
+        <div id="chart-angle" class="w-full h-[300px] hidden mb-4"></div>
+        <div id="chart-vel" class="w-full h-[300px] hidden"></div>
 
-    uploaded_video = st.file_uploader("Wgraj plik wideo (MP4, MOV)", type=['mp4', 'mov'])
-
-    if uploaded_video:
-        if st.button("🚀 Rozpocznij Analizę AI", type="primary"):
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tfile.write(uploaded_video.read())
-            tfile.close()
-
-            cap = cv2.VideoCapture(tfile.name)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        <script>
+            const JOINT_MAP = { "right_arm": [12,14,16], "left_arm": [11,13,15], "right_leg": [24,26,28], "left_leg": [23,25,27] };
+            let times=[], angles=[];
             
-            progress_bar = st.progress(0, text="Uruchamianie silnika AI...")
-            
-            times, angles = [], []
-            min_angle_frame = None
-            min_angle_val = 999.0
-            
-            idx_top, idx_mid, idx_bot = JOINT_MAP[chain_name]
+            const pose = new Pose({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`});
+            pose.setOptions({ modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+            pose.onResults(onResults);
 
-            with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-                frame_count = 0
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret: break
+            function calcAngle(p1, p2, p3) {
+                let v1 = {x: p1.x-p2.x, y: p1.y-p2.y}, v2 = {x: p3.x-p2.x, y: p3.y-p2.y};
+                let dot = v1.x*v2.x + v1.y*v2.y;
+                let mag = Math.sqrt(v1.x*v1.x+v1.y*v1.y) * Math.sqrt(v2.x*v2.x+v2.y*v2.y);
+                return mag === 0 ? 0 : Math.acos(Math.max(-1, Math.min(1, dot/mag))) * 180 / Math.PI;
+            }
+
+            async function startAnalysis() {
+                const file = document.getElementById('video-file').files[0];
+                if(!file) return alert("Wgraj plik wideo");
+                
+                times=[]; angles=[];
+                document.getElementById('canvas').classList.remove('hidden');
+                document.getElementById('status').classList.remove('hidden');
+                document.getElementById('btn-start').disabled = true;
+
+                const vid = document.getElementById('video');
+                vid.src = URL.createObjectURL(file);
+                vid.onloadeddata = () => {
+                    document.getElementById('canvas').width = vid.videoWidth;
+                    document.getElementById('canvas').height = vid.videoHeight;
+                    vid.play();
+                    processFrame();
+                };
+                vid.onended = () => generateReport();
+            }
+
+            async function processFrame() {
+                const vid = document.getElementById('video');
+                if(vid.paused || vid.ended) return;
+                await pose.send({image: vid});
+                requestAnimationFrame(processFrame);
+            }
+
+            function onResults(res) {
+                const ctx = document.getElementById('canvas').getContext('2d');
+                ctx.clearRect(0,0, canvas.width, canvas.height);
+                ctx.drawImage(res.image, 0, 0);
+                
+                if(res.poseLandmarks) {
+                    drawConnectors(ctx, res.poseLandmarks, POSE_CONNECTIONS, {color: '#ffffff', lineWidth: 2});
+                    drawLandmarks(ctx, res.poseLandmarks, {color: '#3b82f6', lineWidth: 1});
                     
-                    frame_count += 1
-                    if frame_count % max(1, (total_frames//100)) == 0:
-                        progress_bar.progress(min(frame_count / total_frames, 1.0), text=f"Przetwarzanie klatki {frame_count}/{total_frames}")
+                    let chain = JOINT_MAP[document.getElementById('ai-chain').value];
+                    let p1 = res.poseLandmarks[chain[0]], p2 = res.poseLandmarks[chain[1]], p3 = res.poseLandmarks[chain[2]];
+                    
+                    if(p1.visibility > 0.4 && p2.visibility > 0.4 && p3.visibility > 0.4) {
+                        angles.push(calcAngle(p1, p2, p3));
+                        times.push(document.getElementById('video').currentTime);
+                    }
+                }
+            }
 
-                    h, w = frame.shape[:2]
-                    if w > 640:
-                        frame = cv2.resize(frame, (640, int(h * (640/w))))
-
-                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    results = pose.process(image_rgb)
-
-                    if results.pose_landmarks:
-                        lm = results.pose_landmarks.landmark
-                        p1 = (lm[idx_top].x, lm[idx_top].y)
-                        p2 = (lm[idx_mid].x, lm[idx_mid].y)
-                        p3 = (lm[idx_bot].x, lm[idx_bot].y)
-
-                        if lm[idx_top].visibility > 0.4 and lm[idx_mid].visibility > 0.4 and lm[idx_bot].visibility > 0.4:
-                            angle = calculate_angle_2d(p1, p2, p3)
-                            t = frame_count / fps
-                            times.append(t)
-                            angles.append(angle)
-
-                            if angle < min_angle_val:
-                                min_angle_val = angle
-                                mp_drawing.draw_landmarks(image_rgb, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-                                min_angle_frame = image_rgb.copy()
-
-            cap.release()
-            progress_bar.progress(1.0, text="Analiza zakończona! Generowanie raportu...")
-
-            if len(angles) < 5:
-                st.error("Nie udało się zidentyfikować sylwetki na wystarczającej liczbie klatek.")
-                return
-
-            df = pd.DataFrame({"Czas": times, "Kat": angles})
-            df['Kat'] = window_mean(df['Kat'], window=5)
-            
-            dt = np.gradient(df['Czas'])
-            df['Predkosc'] = np.gradient(df['Kat'], df['Czas'])
-            df['Predkosc'] = window_mean(df['Predkosc'], window=3)
-            
-            df['Przyspieszenie'] = np.gradient(df['Predkosc'], df['Czas'])
-
-            min_a = df['Kat'].min()
-            max_vel = df['Predkosc'].abs().max()
-            status = "✅ Zaliczony" if min_a <= target_angle else "❌ Zbyt płytko"
-            color_status = "normal" if min_a <= target_angle else "inverse"
-
-            st.divider()
-            
-            col_chart, col_img = st.columns([2, 1])
-            
-            with col_img:
-                st.subheader("Moment krytyczny (Najgłębsze zejście)")
-                if min_angle_frame is not None:
-                    st.image(min_angle_frame, caption=f"Minimalny kąt: {min_a:.1f}°", use_column_width=True)
+            function generateReport() {
+                document.getElementById('status').innerText = "Zakończono!";
+                if(angles.length < 5) return alert("Nie wykryto sylwetki na nagraniu.");
                 
-                st.metric("Ocena wzorca (Cel: ≤"+str(target_angle)+"°)", status, delta_color=color_status)
-                st.metric("Pik Prędkości Koncentrycznej (VBT)", f"{max_vel:.0f} °/s")
-
-            with col_chart:
-                fig1 = go.Figure()
-                fig1.add_trace(go.Scatter(x=df['Czas'], y=df['Kat'], mode='lines', name='Kąt', line=dict(color='#4f46e5', width=3)))
-                fig1.add_hline(y=target_angle, line_dash="dash", line_color="#f97316", annotation_text="Kąt referencyjny")
-                fig1.update_layout(title="Trajektoria Kąta Zgięcia", xaxis_title="Czas [s]", yaxis_title="Kąt [°]", template="plotly_white", margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig1, use_container_width=True)
-
-                fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-                fig2.add_trace(go.Scatter(x=df['Czas'], y=df['Predkosc'], name="Prędkość [°/s]", line=dict(color="#10b981")), secondary_y=False)
-                fig2.add_trace(go.Scatter(x=df['Czas'], y=df['Przyspieszenie'], name="Przyspieszenie [°/s²]", line=dict(color="#f59e0b", dash="dot")), secondary_y=True)
-                fig2.update_layout(title="Profil Dynamiki (VBT)", template="plotly_white", margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig2, use_container_width=True)
-
-# --------------------------------------------------------------------------- #
-# Moduł 2: KINEMATYKA KINOVEA
-# --------------------------------------------------------------------------- #
-def render_kinovea_module():
-    st.title("📐 Kinematyka (Eksport Kinovea)")
-    st.markdown("Wgraj plik CSV z programu Kinovea (wymagane markery: `Gora`, `Srodek`, `Dol`).")
-    
-    target_angle = st.number_input("Kąt docelowy [°]:", value=90)
-    uploaded = st.file_uploader("Wgraj CSV z Kinovea", type=["csv"], key="kine")
-    
-    if uploaded:
-        try:
-            df = pd.read_csv(io.StringIO(_decode_bytes(uploaded.getvalue())), sep=None, engine="python")
-            df.columns = [str(c).strip() for c in df.columns]
-            df = df.apply(_to_numeric).dropna().reset_index(drop=True)
-            
-            angles = []
-            for _, row in df.iterrows():
-                p1 = (row.get('Gora_X'), row.get('Gora_Y'))
-                p2 = (row.get('Srodek_X'), row.get('Srodek_Y'))
-                p3 = (row.get('Dol_X'), row.get('Dol_Y'))
-                if all(x is not None and not np.isnan(x) for x in p1+p2+p3):
-                    angles.append(calculate_angle_2d(p1, p2, p3))
-            
-            if not angles:
-                st.error("Brak poprawnych markerów (Gora, Srodek, Dol).")
-                return
+                let minA = Math.min(...angles);
+                let target = parseFloat(document.getElementById('ai-target').value);
                 
-            df['Kat'] = angles
-            min_a = min(angles)
-            st.metric("Najmniejszy Kąt", f"{min_a:.1f}°")
-            
-            fig = go.Figure(go.Scatter(x=df['Czas'], y=df['Kat'], mode="lines", name="Kąt"))
-            fig.add_hline(y=target_angle, line_dash="dash", line_color="orange")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.error(f"Błąd odczytu: {e}")
+                let vel = [0];
+                for(let i=1; i<angles.length-1; i++) {
+                    let dy = angles[i+1] - angles[i-1], dx = times[i+1] - times[i-1];
+                    vel.push(dx===0 ? 0 : dy/dx);
+                }
+                vel.push(0);
+                let maxV = Math.max(...vel.map(Math.abs));
+
+                document.getElementById('metrics').classList.remove('hidden');
+                document.getElementById('metrics').innerHTML = `
+                    <div class="p-3 border rounded"><div class="text-xs text-gray-500">Min. Kąt</div><div class="text-xl font-bold">${minA.toFixed(1)}°</div></div>
+                    <div class="p-3 border rounded"><div class="text-xs text-gray-500">Ocena (cel: ${target}°)</div><div class="text-xl font-bold">${minA<=target ? '✅' : '❌'}</div></div>
+                    <div class="p-3 border rounded"><div class="text-xs text-gray-500">Pik Prędkości</div><div class="text-xl font-bold text-green-600">${maxV.toFixed(0)} °/s</div></div>
+                `;
+
+                document.getElementById('chart-angle').classList.remove('hidden');
+                document.getElementById('chart-vel').classList.remove('hidden');
+                
+                Plotly.newPlot('chart-angle', [{x:times, y:angles, mode:'lines', line:{color:'blue'}}], {title:'Trajektoria Zgięcia', margin:{t:30,b:30,l:30,r:30}});
+                Plotly.newPlot('chart-vel', [{x:times, y:vel, mode:'lines', line:{color:'green'}}], {title:'Prędkość (VBT)', margin:{t:30,b:30,l:30,r:30}});
+            }
+        </script>
+    </body>
+    </html>
+    """
+    components.html(html_code, height=900, scrolling=True)
 
 # --------------------------------------------------------------------------- #
-# Moduł 3: BIOMECHANIKA BIEGU
+# Moduł 2: HISTORIA GARMIN
 # --------------------------------------------------------------------------- #
-def render_running_module():
-    st.title("👟 Biomechanika biegu (Pojedynczy trening)")
-    uploaded = st.file_uploader("Wgraj CSV z Garmina (kilometry)", type=["csv"])
-    if uploaded:
-        try:
-            df = pd.read_csv(io.StringIO(_decode_bytes(uploaded.getvalue())), sep=None, engine="python")
-            df.columns = [str(c).strip() for c in df.columns]
-            df = df[RUNNING_COLUMNS].apply(_to_numeric).dropna().sort_values("Dystans").reset_index(drop=True)
-            
-            window = st.slider("Wygładzanie wykresu", 1, 15, 3)
-            df['Tetno_sm'] = window_mean(df['Tetno'], window)
-            df['GCT_sm'] = window_mean(df['GCT'], window)
-            
-            fig = make_subplots(specs=[[{"secondary_y": True}]])
-            fig.add_trace(go.Scatter(x=df["Dystans"], y=df['Tetno_sm'], name="Tętno", line=dict(color="red")), secondary_y=False)
-            fig.add_trace(go.Scatter(x=df["Dystans"], y=df['GCT_sm'], name="GCT", line=dict(color="blue")), secondary_y=True)
-            st.plotly_chart(fig, use_container_width=True)
-            
-        except Exception as e:
-            st.error(f"Błąd: {e}")
-
-# --------------------------------------------------------------------------- #
-# Moduł 4: HISTORIA GARMIN
-# --------------------------------------------------------------------------- #
-def render_garmin_history_module():
+def render_garmin_module():
     st.title("📈 Historia Garmin")
-    uploaded = st.file_uploader("Wgraj plik Activities.csv", type=["csv"], key="garmin")
+    uploaded = st.file_uploader("Wgraj plik Activities.csv", type=["csv"])
     if uploaded:
         try:
             df = pd.read_csv(io.StringIO(_decode_bytes(uploaded.getvalue())), sep=None, engine="python")
             df.columns = [str(c).strip() for c in df.columns]
             df['Data'] = pd.to_datetime(df['Data'], errors='coerce')
             
-            available_cols = [c for c in GARMIN_NUMERIC_COLS if c in df.columns]
-            df[available_cols] = df[available_cols].apply(_to_numeric)
-            df = df.dropna(subset=available_cols)
+            avail = [c for c in GARMIN_NUMERIC_COLS if c in df.columns]
+            df[avail] = df[avail].apply(_to_numeric)
+            df = df.dropna(subset=avail)
             
             c1, c2 = st.columns(2)
-            x_axis = c1.selectbox("Oś X", available_cols, index=0)
-            y_axis = c2.selectbox("Oś Y", available_cols, index=min(1, len(available_cols)-1))
+            x_ax = c1.selectbox("Oś X", avail, index=0)
+            y_ax = c2.selectbox("Oś Y", avail, index=min(1, len(avail)-1))
             
             df = df.sort_values('Data')
             df['Data_str'] = df['Data'].dt.strftime('%Y-%m-%d')
-            
-            fig = px.scatter(df, x=x_axis, y=y_axis, size="Dystans", color="Data", hover_name="Data_str")
+            fig = px.scatter(df, x=x_ax, y=y_ax, size="Dystans", color="Data", hover_name="Data_str")
             st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
-            st.error(f"Błąd: {e}")
+            st.error(f"Błąd odczytu: {e}")
 
 # --------------------------------------------------------------------------- #
-# Główna Nawigacja
+# Nawigacja
 # --------------------------------------------------------------------------- #
 PAGES = {
-    "🏠 Strona główna": lambda: st.write("## 🏃 Analiza Biomechaniki\nWybierz moduł z paska bocznego. W najnowszej wersji dostępna jest automatyczna analiza MP4!"),
-    "🤖 AI Wideo & VBT": render_ai_video_module,
-    "📐 Kinematyka CSV (Kinovea)": render_kinovea_module,
-    "👟 Biomechanika biegu": render_running_module,
-    "📈 Historia Garmin": render_garmin_history_module,
+    "🤖 AI Wideo (Edge)": render_ai_video_module,
+    "📈 Historia Garmin": render_garmin_module,
 }
 
 def main():
     st.sidebar.title("Nawigacja")
-    choice = st.sidebar.radio("Wybierz sekcję:", list(PAGES.keys()))
-    st.sidebar.divider()
-    st.sidebar.caption("System Diagnostyki Ruchowej")
+    choice = st.sidebar.radio("Wybierz moduł:", list(PAGES.keys()))
     PAGES[choice]()
 
 if __name__ == "__main__":
