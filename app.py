@@ -1,7 +1,6 @@
 """
-Platforma Diagnostyki Biomechanicznej - Wersja Hybrydowa (Edge AI)
+Platforma Diagnostyki Biomechanicznej
 """
-
 import io
 import numpy as np
 import pandas as pd
@@ -13,10 +12,12 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Biomechanika AI", page_icon="🏃", layout="wide")
 
-GARMIN_NUMERIC_COLS = [
-    "Dystans", "Średnie tętno", "Średni czas kontaktu z podłożem", 
-    "Średnie odchylenie pionowe", "Średnia kadencja biegu", "Suma kalorii"
-]
+GARMIN_NUMERIC_COLS = ["Dystans", "Średnie tętno", "Średni czas kontaktu z podłożem", "Średnie odchylenie pionowe", "Średnia kadencja biegu", "Suma kalorii"]
+RUNNING_COLUMNS = ["Dystans", "Tetno", "GCT"]
+
+def window_mean(series, window):
+    if window <= 1: return series
+    return series.rolling(window=window, center=True, min_periods=1).mean()
 
 def _decode_bytes(raw: bytes) -> str:
     for encoding in ("utf-8-sig", "cp1250", "latin-1"):
@@ -29,12 +30,19 @@ def _to_numeric(series):
         series = series.astype(str).str.strip().str.replace(",", ".", regex=False)
     return pd.to_numeric(series, errors="coerce")
 
+def calculate_angle_2d(a, b, c):
+    ba = np.array([a[0] - b[0], a[1] - b[1]])
+    bc = np.array([c[0] - b[0], c[1] - b[1]])
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    return np.degrees(np.arccos(cosine_angle))
+
 # --------------------------------------------------------------------------- #
-# Moduł 1: AI VIDEO (Działa w przeglądarce - Zero obciążenia serwera)
+# Moduł 1: AI VIDEO (Edge Computing - Bez obciążania serwera)
 # --------------------------------------------------------------------------- #
 def render_ai_video_module():
-    st.title("🤖 Analiza Wideo AI (Edge Computing)")
-    st.markdown("Moduł przetwarza nagranie bezpośrednio w procesorze Twojego urządzenia, całkowicie omijając limity serwerów Streamlit.")
+    st.title("🤖 Analiza Wideo AI (MediaPipe & VBT)")
+    st.markdown("System przetwarza nagranie bezpośrednio w procesorze Twojego urządzenia.")
     
     html_code = """
     <!DOCTYPE html>
@@ -58,13 +66,13 @@ def render_ai_video_module():
                     </select>
                 </div>
                 <div>
-                    <label class="block font-medium mb-1 text-sm">Kąt celu [°]:</label>
+                    <label class="block font-medium mb-1 text-sm">Kąt referencyjny [°]:</label>
                     <input type="number" id="ai-target" value="90" class="w-full p-2 border rounded-lg text-sm">
                 </div>
             </div>
             <input type="file" id="video-file" accept="video/mp4,video/quicktime" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:bg-blue-50 file:text-blue-700">
             <button onclick="startAnalysis()" id="btn-start" class="bg-blue-600 text-white px-5 py-2 rounded-lg text-sm font-medium">Rozpocznij Analizę</button>
-            <div id="status" class="mt-3 text-sm text-blue-600 hidden">Ładowanie sztucznej inteligencji...</div>
+            <div id="status" class="mt-3 text-sm text-blue-600 hidden">Ładowanie modelu sztucznej inteligencji...</div>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
@@ -98,6 +106,7 @@ def render_ai_video_module():
                 times=[]; angles=[];
                 document.getElementById('canvas').classList.remove('hidden');
                 document.getElementById('status').classList.remove('hidden');
+                document.getElementById('status').innerText = "Trwa analiza klatek wideo...";
                 document.getElementById('btn-start').disabled = true;
 
                 const vid = document.getElementById('video');
@@ -138,7 +147,7 @@ def render_ai_video_module():
             }
 
             function generateReport() {
-                document.getElementById('status').innerText = "Zakończono!";
+                document.getElementById('status').innerText = "Analiza zakończona pomyślnie!";
                 if(angles.length < 5) return alert("Nie wykryto sylwetki na nagraniu.");
                 
                 let minA = Math.min(...angles);
@@ -155,7 +164,7 @@ def render_ai_video_module():
                 document.getElementById('metrics').classList.remove('hidden');
                 document.getElementById('metrics').innerHTML = `
                     <div class="p-3 border rounded"><div class="text-xs text-gray-500">Min. Kąt</div><div class="text-xl font-bold">${minA.toFixed(1)}°</div></div>
-                    <div class="p-3 border rounded"><div class="text-xs text-gray-500">Ocena (cel: ${target}°)</div><div class="text-xl font-bold">${minA<=target ? '✅' : '❌'}</div></div>
+                    <div class="p-3 border rounded"><div class="text-xs text-gray-500">Ocena (cel: ${target}°)</div><div class="text-xl font-bold">${minA<=target ? '✅ Zaliczony' : '❌ Zbyt płytko'}</div></div>
                     <div class="p-3 border rounded"><div class="text-xs text-gray-500">Pik Prędkości</div><div class="text-xl font-bold text-green-600">${maxV.toFixed(0)} °/s</div></div>
                 `;
 
@@ -163,7 +172,7 @@ def render_ai_video_module():
                 document.getElementById('chart-vel').classList.remove('hidden');
                 
                 Plotly.newPlot('chart-angle', [{x:times, y:angles, mode:'lines', line:{color:'blue'}}], {title:'Trajektoria Zgięcia', margin:{t:30,b:30,l:30,r:30}});
-                Plotly.newPlot('chart-vel', [{x:times, y:vel, mode:'lines', line:{color:'green'}}], {title:'Prędkość (VBT)', margin:{t:30,b:30,l:30,r:30}});
+                Plotly.newPlot('chart-vel', [{x:times, y:vel, mode:'lines', line:{color:'green'}}], {title:'Prędkość Koncentryczna (VBT)', margin:{t:30,b:30,l:30,r:30}});
             }
         </script>
     </body>
@@ -172,7 +181,69 @@ def render_ai_video_module():
     components.html(html_code, height=900, scrolling=True)
 
 # --------------------------------------------------------------------------- #
-# Moduł 2: HISTORIA GARMIN
+# Moduł 2: KINEMATYKA CSV (Kinovea)
+# --------------------------------------------------------------------------- #
+def render_kinovea_module():
+    st.title("📐 Kinematyka (Eksport Kinovea)")
+    st.markdown("Wgraj plik CSV z programu Kinovea (wymagane markery: `Gora`, `Srodek`, `Dol`).")
+    
+    target_angle = st.number_input("Kąt docelowy [°]:", value=90)
+    uploaded = st.file_uploader("Wgraj CSV z Kinovea", type=["csv"], key="kine")
+    
+    if uploaded:
+        try:
+            df = pd.read_csv(io.StringIO(_decode_bytes(uploaded.getvalue())), sep=None, engine="python")
+            df.columns = [str(c).strip() for c in df.columns]
+            df = df.apply(_to_numeric).dropna().reset_index(drop=True)
+            
+            angles = []
+            for _, row in df.iterrows():
+                p1 = (row.get('Gora_X'), row.get('Gora_Y'))
+                p2 = (row.get('Srodek_X'), row.get('Srodek_Y'))
+                p3 = (row.get('Dol_X'), row.get('Dol_Y'))
+                if all(x is not None and not np.isnan(x) for x in p1+p2+p3):
+                    angles.append(calculate_angle_2d(p1, p2, p3))
+            
+            if not angles:
+                st.error("Brak poprawnych markerów (Gora, Srodek, Dol).")
+                return
+                
+            df['Kat'] = angles
+            min_a = min(angles)
+            st.metric("Najmniejszy Kąt", f"{min_a:.1f}°")
+            
+            fig = go.Figure(go.Scatter(x=df['Czas'], y=df['Kat'], mode="lines", name="Kąt"))
+            fig.add_hline(y=target_angle, line_dash="dash", line_color="orange")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Błąd odczytu: {e}")
+
+# --------------------------------------------------------------------------- #
+# Moduł 3: BIOMECHANIKA BIEGU
+# --------------------------------------------------------------------------- #
+def render_running_module():
+    st.title("👟 Biomechanika biegu (Pojedynczy trening)")
+    uploaded = st.file_uploader("Wgraj CSV z Garmina (kilometry)", type=["csv"])
+    if uploaded:
+        try:
+            df = pd.read_csv(io.StringIO(_decode_bytes(uploaded.getvalue())), sep=None, engine="python")
+            df.columns = [str(c).strip() for c in df.columns]
+            df = df[RUNNING_COLUMNS].apply(_to_numeric).dropna().sort_values("Dystans").reset_index(drop=True)
+            
+            window = st.slider("Wygładzanie wykresu", 1, 15, 3)
+            df['Tetno_sm'] = window_mean(df['Tetno'], window)
+            df['GCT_sm'] = window_mean(df['GCT'], window)
+            
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Scatter(x=df["Dystans"], y=df['Tetno_sm'], name="Tętno", line=dict(color="red")), secondary_y=False)
+            fig.add_trace(go.Scatter(x=df["Dystans"], y=df['GCT_sm'], name="GCT", line=dict(color="blue")), secondary_y=True)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"Błąd: {e}")
+
+# --------------------------------------------------------------------------- #
+# Moduł 4: HISTORIA GARMIN
 # --------------------------------------------------------------------------- #
 def render_garmin_module():
     st.title("📈 Historia Garmin")
@@ -203,6 +274,8 @@ def render_garmin_module():
 # --------------------------------------------------------------------------- #
 PAGES = {
     "🤖 AI Wideo (Edge)": render_ai_video_module,
+    "📐 Kinematyka CSV (Kinovea)": render_kinovea_module,
+    "👟 Biomechanika biegu": render_running_module,
     "📈 Historia Garmin": render_garmin_module,
 }
 
